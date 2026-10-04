@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sync"
 
 	"github.com/cli/go-gh/v2/pkg/api"
 	graphql "github.com/cli/shurcooL-graphql"
@@ -52,12 +53,16 @@ func (pr *PullRequest) IsAutoMergeEnabled() bool {
 
 // Client wraps GitHub API operations.
 type Client struct {
-	gql   *api.GraphQLClient
 	rest  *api.RESTClient
 	host  string
 	owner string
 	repo  string
 	slug  string
+
+	// mu guards prNumbers, which maps PR node IDs seen in responses to PR
+	// numbers so node-ID based methods can address PRs over REST.
+	mu        sync.Mutex
+	prNumbers map[string]int
 }
 
 // NewClient creates a new GitHub API client for the given repository.
@@ -69,16 +74,11 @@ func NewClient(host, owner, repo string) (*Client, error) {
 		host = "github.com"
 	}
 	opts := api.ClientOptions{Host: host}
-	gql, err := api.NewGraphQLClient(opts)
-	if err != nil {
-		return nil, fmt.Errorf("creating GraphQL client: %w", err)
-	}
 	rest, err := api.NewRESTClient(opts)
 	if err != nil {
 		return nil, fmt.Errorf("creating REST client: %w", err)
 	}
 	return &Client{
-		gql:   gql,
 		rest:  rest,
 		host:  host,
 		owner: owner,
@@ -93,104 +93,6 @@ func PRURL(host, owner, repo string, number int) string {
 		host = "github.com"
 	}
 	return fmt.Sprintf("https://%s/%s/%s/pull/%d", host, owner, repo, number)
-}
-
-// FindPRForBranch finds an open PR by head branch name.
-func (c *Client) FindPRForBranch(branch string) (*PullRequest, error) {
-	var query struct {
-		Repository struct {
-			PullRequests struct {
-				Nodes []struct {
-					ID               string            `graphql:"id"`
-					Number           int               `graphql:"number"`
-					URL              string            `graphql:"url"`
-					Title            string            `graphql:"title"`
-					Body             string            `graphql:"body"`
-					BaseRefName      string            `graphql:"baseRefName"`
-					IsDraft          bool              `graphql:"isDraft"`
-					MergeQueueEntry  *MergeQueueEntry  `graphql:"mergeQueueEntry"`
-					AutoMergeRequest *AutoMergeRequest `graphql:"autoMergeRequest"`
-				}
-			} `graphql:"pullRequests(headRefName: $head, states: [OPEN], first: 1)"`
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner": graphql.String(c.owner),
-		"name":  graphql.String(c.repo),
-		"head":  graphql.String(branch),
-	}
-
-	if err := c.gql.Query("FindPRForBranch", &query, variables); err != nil {
-		return nil, fmt.Errorf("querying PRs: %w", err)
-	}
-
-	nodes := query.Repository.PullRequests.Nodes
-	if len(nodes) == 0 {
-		return nil, nil
-	}
-
-	n := nodes[0]
-	return &PullRequest{
-		ID:               n.ID,
-		Number:           n.Number,
-		URL:              n.URL,
-		Title:            n.Title,
-		Body:             n.Body,
-		BaseRefName:      n.BaseRefName,
-		IsDraft:          n.IsDraft,
-		MergeQueueEntry:  n.MergeQueueEntry,
-		AutoMergeRequest: n.AutoMergeRequest,
-	}, nil
-}
-
-// CreatePR creates a new pull request.
-func (c *Client) CreatePR(base, head, title, body string, draft bool) (*PullRequest, error) {
-	var mutation struct {
-		CreatePullRequest struct {
-			PullRequest struct {
-				ID     string
-				Number int
-				URL    string `graphql:"url"`
-			}
-		} `graphql:"createPullRequest(input: $input)"`
-	}
-
-	repoID, err := c.repositoryID()
-	if err != nil {
-		return nil, err
-	}
-
-	type CreatePullRequestInput struct {
-		RepositoryID string `json:"repositoryId"`
-		BaseRefName  string `json:"baseRefName"`
-		HeadRefName  string `json:"headRefName"`
-		Title        string `json:"title"`
-		Body         string `json:"body,omitempty"`
-		Draft        bool   `json:"draft"`
-	}
-
-	variables := map[string]interface{}{
-		"input": CreatePullRequestInput{
-			RepositoryID: repoID,
-			BaseRefName:  base,
-			HeadRefName:  head,
-			Title:        title,
-			Body:         body,
-			Draft:        draft,
-		},
-	}
-
-	if err := c.gql.Mutate("CreatePullRequest", &mutation, variables); err != nil {
-		return nil, fmt.Errorf("creating PR: %w", err)
-	}
-
-	pr := mutation.CreatePullRequest.PullRequest
-	return &PullRequest{
-		ID:     pr.ID,
-		Number: pr.Number,
-		URL:    pr.URL,
-	}, nil
 }
 
 // UpdatePRBase updates the base branch of an existing pull request.
@@ -208,79 +110,6 @@ func (c *Client) UpdatePRBase(number int, base string) error {
 	return c.rest.Patch(path, bytes.NewReader(body), nil)
 }
 
-// MarkPRReadyForReview converts a draft pull request to ready for review.
-func (c *Client) MarkPRReadyForReview(prID string) error {
-	var mutation struct {
-		MarkPullRequestReadyForReview struct {
-			PullRequest struct {
-				ID string
-			}
-		} `graphql:"markPullRequestReadyForReview(input: $input)"`
-	}
-
-	type MarkPullRequestReadyForReviewInput struct {
-		PullRequestID string `json:"pullRequestId"`
-	}
-
-	variables := map[string]interface{}{
-		"input": MarkPullRequestReadyForReviewInput{
-			PullRequestID: prID,
-		},
-	}
-
-	if err := c.gql.Mutate("MarkPullRequestReadyForReview", &mutation, variables); err != nil {
-		return fmt.Errorf("marking PR ready for review: %w", err)
-	}
-
-	return nil
-}
-
-// DisableAutoMerge disables auto-merge on a pull request.
-func (c *Client) DisableAutoMerge(prID string) error {
-	var mutation struct {
-		DisablePullRequestAutoMerge struct {
-			PullRequest struct {
-				ID string
-			}
-		} `graphql:"disablePullRequestAutoMerge(input: $input)"`
-	}
-
-	type DisablePullRequestAutoMergeInput struct {
-		PullRequestID string `json:"pullRequestId"`
-	}
-
-	variables := map[string]interface{}{
-		"input": DisablePullRequestAutoMergeInput{
-			PullRequestID: prID,
-		},
-	}
-
-	if err := c.gql.Mutate("DisablePullRequestAutoMerge", &mutation, variables); err != nil {
-		return fmt.Errorf("disabling auto-merge: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Client) repositoryID() (string, error) {
-	var query struct {
-		Repository struct {
-			ID string
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner": graphql.String(c.owner),
-		"name":  graphql.String(c.repo),
-	}
-
-	if err := c.gql.Query("RepositoryID", &query, variables); err != nil {
-		return "", fmt.Errorf("fetching repository ID: %w", err)
-	}
-
-	return query.Repository.ID, nil
-}
-
 // PRDetails holds enriched pull request data for display in the TUI.
 type PRDetails struct {
 	Number   int
@@ -291,106 +120,6 @@ type PRDetails struct {
 	IsDraft  bool
 	Merged   bool
 	IsQueued bool
-}
-
-// FindPRDetailsForBranch fetches enriched PR data for display purposes.
-// Returns nil without error if no PR exists for the branch.
-func (c *Client) FindPRDetailsForBranch(branch string) (*PRDetails, error) {
-	var query struct {
-		Repository struct {
-			PullRequests struct {
-				Nodes []struct {
-					Number          int              `graphql:"number"`
-					State           string           `graphql:"state"`
-					URL             string           `graphql:"url"`
-					IsDraft         bool             `graphql:"isDraft"`
-					Merged          bool             `graphql:"merged"`
-					MergeQueueEntry *MergeQueueEntry `graphql:"mergeQueueEntry"`
-				}
-			} `graphql:"pullRequests(headRefName: $head, last: 1)"`
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner": graphql.String(c.owner),
-		"name":  graphql.String(c.repo),
-		"head":  graphql.String(branch),
-	}
-
-	if err := c.gql.Query("FindPRDetailsForBranch", &query, variables); err != nil {
-		return nil, fmt.Errorf("querying PR details: %w", err)
-	}
-
-	nodes := query.Repository.PullRequests.Nodes
-	if len(nodes) == 0 {
-		return nil, nil
-	}
-
-	n := nodes[0]
-	return &PRDetails{
-		Number:   n.Number,
-		State:    n.State,
-		URL:      n.URL,
-		IsDraft:  n.IsDraft,
-		Merged:   n.Merged,
-		IsQueued: n.MergeQueueEntry != nil && n.MergeQueueEntry.ID != "",
-	}, nil
-}
-
-// FindPRByNumber fetches a pull request by its number.
-func (c *Client) FindPRByNumber(number int) (*PullRequest, error) {
-	gqlNumber, err := toGraphQLInt(number)
-	if err != nil {
-		return nil, err
-	}
-
-	var query struct {
-		Repository struct {
-			PullRequest struct {
-				ID               string            `graphql:"id"`
-				Number           int               `graphql:"number"`
-				State            string            `graphql:"state"`
-				URL              string            `graphql:"url"`
-				Title            string            `graphql:"title"`
-				Body             string            `graphql:"body"`
-				HeadRefName      string            `graphql:"headRefName"`
-				BaseRefName      string            `graphql:"baseRefName"`
-				IsDraft          bool              `graphql:"isDraft"`
-				Merged           bool              `graphql:"merged"`
-				MergeQueueEntry  *MergeQueueEntry  `graphql:"mergeQueueEntry"`
-				AutoMergeRequest *AutoMergeRequest `graphql:"autoMergeRequest"`
-			} `graphql:"pullRequest(number: $number)"`
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner":  graphql.String(c.owner),
-		"name":   graphql.String(c.repo),
-		"number": gqlNumber,
-	}
-
-	if err := c.gql.Query("FindPRByNumber", &query, variables); err != nil {
-		return nil, fmt.Errorf("querying PR #%d: %w", number, err)
-	}
-
-	n := query.Repository.PullRequest
-	if n.Number == 0 && n.ID == "" {
-		return nil, nil
-	}
-	return &PullRequest{
-		ID:               n.ID,
-		Number:           n.Number,
-		State:            n.State,
-		URL:              n.URL,
-		Title:            n.Title,
-		Body:             n.Body,
-		HeadRefName:      n.HeadRefName,
-		BaseRefName:      n.BaseRefName,
-		IsDraft:          n.IsDraft,
-		Merged:           n.Merged,
-		MergeQueueEntry:  n.MergeQueueEntry,
-		AutoMergeRequest: n.AutoMergeRequest,
-	}, nil
 }
 
 func toGraphQLInt(n int) (graphql.Int, error) {
