@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/cli/go-gh/v2/pkg/api"
-	graphql "github.com/cli/shurcooL-graphql"
 )
 
 // Merge method values accepted by the async merge REST API.
@@ -127,83 +126,6 @@ func (r *AsyncMergeResult) IsPending() bool {
 	return r != nil && r.Status == AsyncMergeStatusPending
 }
 
-// RepoMergeConfig fetches the repository's allowed merge methods and the
-// viewer's default (last-used) merge method.
-func (c *Client) RepoMergeConfig() (*RepoMergeConfig, error) {
-	var query struct {
-		Repository struct {
-			MergeCommitAllowed       bool   `graphql:"mergeCommitAllowed"`
-			SquashMergeAllowed       bool   `graphql:"squashMergeAllowed"`
-			RebaseMergeAllowed       bool   `graphql:"rebaseMergeAllowed"`
-			ViewerDefaultMergeMethod string `graphql:"viewerDefaultMergeMethod"`
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner": graphql.String(c.owner),
-		"name":  graphql.String(c.repo),
-	}
-
-	if err := c.gql.Query("RepoMergeConfig", &query, variables); err != nil {
-		return nil, fmt.Errorf("querying repository merge config: %w", err)
-	}
-
-	r := query.Repository
-	return &RepoMergeConfig{
-		MergeAllowed:  r.MergeCommitAllowed,
-		SquashAllowed: r.SquashMergeAllowed,
-		RebaseAllowed: r.RebaseMergeAllowed,
-		DefaultMethod: mergeMethodFromEnum(r.ViewerDefaultMergeMethod),
-	}, nil
-}
-
-// BaseBranchUsesMergeQueue reports whether the given base branch merges through a
-// merge queue, detected via the branch's merge queue object or a MERGE_QUEUE
-// repository rule. It is used only to tailor the merge wizard (skipping the
-// merge-method step and switching to "enqueue" wording): the async stack merge
-// itself always sends merge_action "default", which lets the server route the
-// stack to the queue or a direct merge automatically.
-func (c *Client) BaseBranchUsesMergeQueue(baseRef string) (bool, error) {
-	var query struct {
-		Repository struct {
-			MergeQueue *struct {
-				ID string `graphql:"id"`
-			} `graphql:"mergeQueue(branch: $branch)"`
-			Ref *struct {
-				Rules struct {
-					Nodes []struct {
-						Type string `graphql:"type"`
-					} `graphql:"nodes"`
-				} `graphql:"rules(first: 50)"`
-			} `graphql:"ref(qualifiedName: $qualified)"`
-		} `graphql:"repository(owner: $owner, name: $name)"`
-	}
-
-	variables := map[string]interface{}{
-		"owner":     graphql.String(c.owner),
-		"name":      graphql.String(c.repo),
-		"branch":    graphql.String(baseRef),
-		"qualified": graphql.String("refs/heads/" + baseRef),
-	}
-
-	if err := c.gql.Query("BaseBranchMergeQueue", &query, variables); err != nil {
-		return false, fmt.Errorf("querying base branch merge queue: %w", err)
-	}
-
-	r := query.Repository
-	if r.MergeQueue != nil {
-		return true, nil
-	}
-	if r.Ref != nil {
-		for _, node := range r.Ref.Rules.Nodes {
-			if node.Type == "MERGE_QUEUE" {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
 // MergeStackAsync requests an asynchronous merge of the given pull request. For
 // a stacked PR this merges all members of the stack up to and including
 // prNumber. A blank method lets the server apply its default.
@@ -251,49 +173,6 @@ func (c *Client) GetAsyncMergeResult(prNumber int, uuid string) (*AsyncMergeResu
 		return nil, err
 	}
 	return &result, nil
-}
-
-// PRTitles fetches the titles for a set of pull request numbers in a single
-// GraphQL query. Missing PRs are simply absent from the result. Best-effort:
-// callers may ignore the error and proceed without titles.
-func (c *Client) PRTitles(numbers []int) (map[int]string, error) {
-	titles := make(map[int]string, len(numbers))
-	if len(numbers) == 0 {
-		return titles, nil
-	}
-
-	// Batch to keep individual queries small for very large stacks.
-	const batchSize = 50
-	for start := 0; start < len(numbers); start += batchSize {
-		end := start + batchSize
-		if end > len(numbers) {
-			end = len(numbers)
-		}
-
-		var q strings.Builder
-		q.WriteString("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){")
-		for i, n := range numbers[start:end] {
-			fmt.Fprintf(&q, "pr%d:pullRequest(number:%d){number title} ", i, n)
-		}
-		q.WriteString("}}")
-
-		var resp struct {
-			Repository map[string]struct {
-				Number int    `json:"number"`
-				Title  string `json:"title"`
-			} `json:"repository"`
-		}
-		vars := map[string]interface{}{"owner": c.owner, "name": c.repo}
-		if err := c.gql.Do(q.String(), vars, &resp); err != nil {
-			return titles, fmt.Errorf("querying pull request titles: %w", err)
-		}
-		for _, pr := range resp.Repository {
-			if pr.Number != 0 {
-				titles[pr.Number] = pr.Title
-			}
-		}
-	}
-	return titles, nil
 }
 
 // classifyAsyncMergeError maps a go-gh REST error into a domain error. A 404
